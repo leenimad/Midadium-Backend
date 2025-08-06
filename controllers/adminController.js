@@ -3,9 +3,14 @@
 const User = require('../models/UserModel');
 const Course = require('../models/courseModel');
 const mongoose = require('mongoose');
- const ActivityLog = require('../models/ActivityLogModel'); // <-- Import ActivityLog model when created
- 
+const ActivityLog = require('../models/ActivityLogModel'); // <-- Import ActivityLog model when created
+const Subject = require('../models/SubjectModel'); // *** IMPORT ***
 
+const Enrollment = require('../models/EnrollmentModel'); // *** IMPORT ***
+const StudentProgress = require('../models/StudentProgressModel'); // *** IMPORT
+const Lesson = require('../models/LessonModel'); // Import Lesson model
+const ProblemReport = require('../models/ProblemReportModel');
+const { createChatroomForCourse } = require('../utils/chatroomUtils');
 // Helper function for logging (replace with actual implementation)
 // IMPORTANT: You need the actor's username. Ensure req.user contains it or fetch it.
 const logAdminActivity = async (req, actionType, targetType, targetId, targetName, details) => {
@@ -71,7 +76,23 @@ const getAllTeachers = async (req, res) => {
 
 const getTeacherById = async (req, res) => {
   try {
-    const teacher = await User.findById(req.params.id).populate('courses').select('-password'); // Populate assigned courses
+    const teacherId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(teacherId)) {
+        return res.status(400).json({ message: "Invalid Teacher ID format." });
+    }
+
+    const teacher = await User.findById(teacherId)
+      .select('-password') // Select fields to exclude/include first
+      .populate({
+          path: 'courses', // Populate the 'courses' array on the User model
+          select: 'name description subject price status', // Select desired fields from Course
+          populate: { // *** NESTED POPULATE for the 'subject' field WITHIN each course ***
+              path: 'subject',
+              select: 'name' // Select only the name from the Subject model
+          }
+      })
+      .lean(); // Use lean if you don't need Mongoose documents on backend
+
     if (!teacher) {
       return res.status(404).json({ message: "Teacher not found" });
     }
@@ -318,8 +339,10 @@ const getAllCourses = async (req, res) => {
   try {
     let query = {};
     if (req.query.status) query.status = req.query.status;
-    if (req.query.subject) query.subject = req.query.subject;
-    if (req.query.grade) query.grade = req.query.grade;
+    if (req.query.subjectId) { // Filter by subject ID now
+        if (!mongoose.Types.ObjectId.isValid(req.query.subjectId)) { return res.status(400).json({ message: 'Invalid subject ID format.' }); }
+        query.subject = req.query.subjectId;
+    }
     if (req.query.teacher) {
         // Ensure teacher is a valid ObjectId if provided
          if (!mongoose.Types.ObjectId.isValid(req.query.teacher)) {
@@ -328,40 +351,36 @@ const getAllCourses = async (req, res) => {
          query.teacher = req.query.teacher;
     }
 
-    const courses = await Course.find(query).populate('teacher', 'username email').lean(); // Populate teacher's username/email, use lean
+    const courses = await Course.find(query).populate('teacher', 'username email').populate('subject', 'name') .lean(); // Populate teacher's username/email, use lean
     res.status(200).json(courses);
   } catch (error) {
     console.error("Error fetching courses:", error);
     res.status(500).json({ message: "Failed to fetch courses" });
   }
 };
- 
+ //////////////////////////////////////// get course by id /////////////
 const getCourseById = async (req, res) => {
   try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) { return res.status(400).json({ message: 'Invalid Course ID format.' }); }
     const course = await Course.findById(req.params.id)
-    .populate('teacher', 'username email') // Keep teacher populate
-    .populate('students', 'username email grade') // <-- ADD THIS POPULATE
-    .lean();
-    if (!course) {
-      return res.status(404).json({ message: "Course not found" });
-    }
+                                 .populate('teacher', 'username email')
+                                 .populate('subject', 'name') // Populate subject name
+                                 // Do NOT populate students here for admin view unless needed
+                                 .lean();
+    if (!course) { return res.status(404).json({ message: "Course not found" }); }
+    
     res.status(200).json(course);
   } catch (error) {
     console.error("Error fetching course by ID:", error);
     res.status(500).json({ message: "Failed to fetch course" });
   }
 };
-
+////////////// approve course ////////////
 const approveCourse = async (req, res) => {
   try {
-    const course = await Course.findByIdAndUpdate(req.params.id, { status: 'approved' }, { new: true });
-    if (!course) {
-      return res.status(404).json({ message: "Course not found" });
-    }
-
-    // Log activity
+    const course = await Course.findByIdAndUpdate(req.params.id, { status: 'approved' }, { new: true }).populate('subject','name');
+    if (!course) { return res.status(404).json({ message: "Course not found" }); }
     await logAdminActivity(req, 'COURSE_APPROVED', 'Course', course._id, course.name);
-
     res.status(200).json({ message: "Course approved", course });
   } catch (error) {
     console.error("Error approving course:", error);
@@ -385,112 +404,169 @@ const rejectCourse = async (req, res) => {
     res.status(500).json({ message: "Failed to reject course" });
   }
 };
-
+//////////////////////////// update Course //////////////////
 const updateCourse = async (req, res) => {
   try {
-    const { name, description, subject, grade, syllabus, resources, teacher } = req.body;
     const courseId = req.params.id;
-    let teacherName = null; // For logging
+    if (!mongoose.Types.ObjectId.isValid(courseId)) { return res.status(400).json({ message: 'Invalid Course ID format.' }); }
 
-    // Validate incoming data
-    if (teacher && !mongoose.Types.ObjectId.isValid(teacher)) {
-        return res.status(400).json({ message: 'Invalid Teacher ID provided for update' });
+   // *** REMOVED grade, ADDED subjectId, price ***
+   const { name, description, subjectId, syllabus, resources, teacher, price } = req.body;
+    // Allow teachers to update their own courses, admins can update any
+    const courseToUpdate = await Course.findById(courseId);
+    if (!courseToUpdate) { return res.status(404).json({ message: 'Course not found.' }); }
+    
+        // Authorization check: Only admin or the course's original teacher can update
+        if (req.user.role !== 'admin' && courseToUpdate.teacher.toString() !== req.user.id) {
+          return res.status(403).json({ message: 'Forbidden: You cannot update this course.' });
+      }
+
+     let teacherName = null; // For logging
+
+     const updateData = {};
+        if (name !== undefined) updateData.name = name.trim();
+        if (description !== undefined) updateData.description = description.trim();
+        if (syllabus !== undefined) updateData.syllabus = syllabus.trim();
+        if (resources !== undefined) updateData.resources = resources.trim();
+         if (price !== undefined && price !== null) {
+            if (typeof price !== 'number' || price < 0) return res.status(400).json({ message: 'Invalid price.' });
+            updateData.price = price;
+         }
+
+         // Validate Subject ID if provided
+         if (subjectId !== undefined) {
+            if (!mongoose.Types.ObjectId.isValid(subjectId)) return res.status(400).json({ message: 'Invalid Subject ID.' });
+            const subjectExists = await Subject.findById(subjectId).lean();
+            if (!subjectExists) return res.status(400).json({ message: 'Selected subject not found.' });
+            updateData.subject = subjectId;
+         }
+
+         // Validate and Handle Teacher Reassignment (Only Admin Should Do This?)
+         // Decide if teachers can reassign their own courses - typically NO.
+         if (teacher !== undefined && req.user.role === 'admin') { // Only allow admin to change teacher
+             if (!mongoose.Types.ObjectId.isValid(teacher)) return res.status(400).json({ message: 'Invalid Teacher ID.' });
+             const teacherUser = await User.findById(teacher).select('username role').lean();
+             if (!teacherUser || teacherUser.role !== 'teacher') return res.status(400).json({ message: 'New teacher not found or is not a teacher.' });
+             updateData.teacher = teacher;
+             teacherName = teacherUser.username; // For logging
+         } else if (teacher !== undefined && req.user.role !== 'admin') {
+              console.warn(`Teacher ${req.user.id} attempted to reassign course ${courseId}. Blocked.`);
+              // Silently ignore or return error
+              // return res.status(403).json({ message: 'Only admins can reassign courses to different teachers.' });
+         }
+
+
+         // --- Perform Update ---
+         const updatedCourse = await Course.findByIdAndUpdate( courseId, updateData, { new: true, runValidators: true } )
+                                            .populate('teacher', 'username email')
+                                            .populate('subject', 'name'); // Populate new subject field
+
+         if (!updatedCourse) { return res.status(404).json({ message: 'Course not found after update attempt.' }); }
+
+         // --- Handle Teacher's Course List (if teacher changed by admin) ---
+         if (teacher !== undefined && req.user.role === 'admin' && courseToUpdate.teacher.toString() !== updatedCourse.teacher._id.toString()) {
+             // Remove from old teacher
+             await User.findByIdAndUpdate(courseToUpdate.teacher, { $pull: { courses: courseId } });
+             // Add to new teacher
+             await User.findByIdAndUpdate(updatedCourse.teacher._id, { $addToSet: { courses: courseId } });
+         }
+
+         // Log activity
+         await logAdminActivity(req, 'COURSE_UPDATED', 'Course', updatedCourse._id, updatedCourse.name, { teacherAssigned: updatedCourse.teacher.username, subject: updatedCourse.subject.name });
+
+         res.status(200).json({ message: 'Course updated', course: updatedCourse });
+    } catch (error) {
+        if (error.name === 'ValidationError') { return res.status(400).json({ message: Object.values(error.errors).map(e => e.message).join(', ') }); }
+        console.error("Update Course Error:", error);
+        res.status(500).json({ message: 'Failed to update course' });
     }
-    // Optionally check if teacher exists and is actually a teacher
-    if (teacher) {
-        const teacherUser = await User.findById(teacher).select('username role');
-        if (!teacherUser || teacherUser.role !== 'teacher') {
-             return res.status(400).json({ message: 'Assigned teacher not found or is not a teacher' });
-        }
-        teacherName = teacherUser.username; // Get name for logging
-    }
-
-
-    // Prepare update data, only including fields provided
-    const updateData = {};
-    if (name !== undefined) updateData.name = name;
-    if (description !== undefined) updateData.description = description;
-    if (subject !== undefined) updateData.subject = subject;
-    if (grade !== undefined) updateData.grade = grade;
-    if (syllabus !== undefined) updateData.syllabus = syllabus;
-    if (resources !== undefined) updateData.resources = resources;
-    if (teacher !== undefined) updateData.teacher = teacher; // Can be null to unassign
-
-    // Fetch the course before update to handle teacher assignments later
-    const courseBeforeUpdate = await Course.findById(courseId);
-     if (!courseBeforeUpdate) {
-      return res.status(404).json({ message: "Course not found" });
-    }
-
-
-    // Perform the update
-    const updatedCourse = await Course.findByIdAndUpdate(
-      courseId,
-      updateData,
-      { new: true, runValidators: true }
-    ).populate('teacher', 'username email'); // Keep populate
-
-    if (!updatedCourse) {
-      // Should not happen if courseBeforeUpdate was found, but safety check
-      return res.status(404).json({ message: "Course not found after update attempt" });
-    }
-
-    // Handle Teacher Course List Updates (if teacher changed)
-    const oldTeacherId = courseBeforeUpdate.teacher;
-    const newTeacherId = updatedCourse.teacher ? updatedCourse.teacher._id : null; // Updated teacher ID (could be null)
-
-    if ((oldTeacherId?.toString() ?? null) !== (newTeacherId?.toString() ?? null)) {
-        // Remove from old teacher's list if they existed
-        if (oldTeacherId) {
-            await User.findByIdAndUpdate(oldTeacherId, { $pull: { courses: courseId } });
-        }
-        // Add to new teacher's list if assigned
-        if (newTeacherId) {
-            await User.findByIdAndUpdate(newTeacherId, { $addToSet: { courses: courseId } });
-        }
-    }
-
-    // Log activity
-    await logAdminActivity(req, 'COURSE_UPDATED', 'Course', updatedCourse._id, updatedCourse.name, { teacherAssigned: teacherName });
-
-    res.status(200).json({ message: "Course updated", course: updatedCourse });
-  } catch (error) {
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({ message: messages.join(', ') });
-    }
-    console.error("Update Course Error:", error);
-    res.status(500).json({ message: "Failed to update course" });
-  }
 };
-
+////////////////////////// add course //////////////
 const addCourse = async (req, res) => {
   try {
-    const { name, description, teacher, subject, grade, syllabus, resources } = req.body;
-    let teacherUsername = 'Unknown'; // For logging
+    const {  name, description, subjectId, syllabus, resources, price } = req.body;
+    const actorId = req.user.id;
+    const actorUsername = req.user.username;
+    const actorRole = req.user.role;
+    let courseTeacherId;
+    let courseTeacherUsername = 'Unknown';
+    if (actorRole === 'teacher') {
+      courseTeacherId = actorId; // Teacher creates course for themselves
+      courseTeacherUsername = actorUsername;
+  } else if (actorRole === 'admin') {
+    
+      // If admin is creating, they MUST provide the intended teacher's ID
+       if (!req.body.teacher || !mongoose.Types.ObjectId.isValid(req.body.teacher)) {
+           return res.status(400).json({ message: 'Admin must specify a valid Teacher ID when creating a course.' });
+       }
+       const assignedTeacher = await User.findById(req.body.teacher).select('username role').lean();
+       if (!assignedTeacher || assignedTeacher.role !== 'teacher') {
+           return res.status(400).json({ message: 'Specified teacher not found or is not a teacher.' });
+       }
+       courseTeacherId = req.body.teacher;
+       courseTeacherUsername = assignedTeacher.username;
 
-    if (!mongoose.Types.ObjectId.isValid(teacher)) {
-        return res.status(400).json({ message: 'Invalid teacher ID' });
-    }
-    // Check if teacher exists and is a teacher
-     const teacherUser = await User.findById(teacher).select('username role');
-     if (!teacherUser || teacherUser.role !== 'teacher') {
-         return res.status(400).json({ message: 'Assigned teacher not found or is not a teacher' });
-     }
-     teacherUsername = teacherUser.username;
+  } else {
+      // Should not happen if authorizeRoles middleware is used correctly
+      return res.status(403).json({ message: 'Forbidden: Only Teachers or Admins can create courses.' });
+  }
 
-    const newCourse = new Course({
-      name, description, teacher, subject, grade, syllabus, resources
-    });
-    await newCourse.save();
+     // Validate required fields
+     if (!name || !description || !subjectId || price === undefined || price === null) {
+      return res.status(400).json({ message: 'Missing required fields: name, description, subjectId, price.' });
+ }
+
+   // Validate IDs
+   if (!mongoose.Types.ObjectId.isValid(courseTeacherId) || !mongoose.Types.ObjectId.isValid(subjectId)) {
+    return res.status(400).json({ message: 'Invalid teacher or subject ID.' });
+}
+
+if (!mongoose.Types.ObjectId.isValid(subjectId)) {
+  return res.status(400).json({ message: 'Invalid Subject ID format.' });
+}
+if (typeof price !== 'number' || price < 0) {
+  return res.status(400).json({ message: 'Invalid price. Must be a non-negative number.' });
+}
+
+// Check if teacher & subject exist and teacher is valid role
+const [teacherUser, subjectExists] = await Promise.all([
+     User.findById(courseTeacherId).select('username role').lean(),
+     Subject.findById(subjectId).lean()
+ ]);
+
+if (!teacherUser || teacherUser.role !== 'teacher') {
+    return res.status(400).json({ message: 'Assigned teacher not found or is not a teacher.' });
+}
+if (!subjectExists) {
+     return res.status(400).json({ message: 'Selected subject not found.' });
+}
+courseTeacherUsername = teacherUser.username;
+
+const newCourse = new Course({
+  name: name.trim(),
+   description: description.trim(), 
+   teacher: courseTeacherId,
+  subject: subjectId, // *** Use subjectId ***
+  syllabus: syllabus?.trim(), resources: resources?.trim(), status: 'pending', // default status
+  price: price // Add price
+});
+await newCourse.save();
 
     // Update the teacher's courses array
-    await User.findByIdAndUpdate(teacher, { $addToSet: { courses: newCourse._id } });
+    await User.findByIdAndUpdate(courseTeacherId, { $addToSet: { courses: newCourse._id } });
+
+   // CREATE CHATROOM IN FIRESTORE 
+    if (newCourse._id && courseTeacherId && newCourse.name) {
+       await createChatroomForCourse(newCourse._id, courseTeacherId, newCourse.name);
+    }
+    // END CREATE CHATROOM 
+
 
     // Log activity
-    await logAdminActivity(req, 'COURSE_ADDED', 'Course', newCourse._id, newCourse.name, { teacherAssigned: teacherUsername });
+    await logAdminActivity(req, 'COURSE_ADDED', 'Course', newCourse._id, newCourse.name, { teacherAssigned: courseTeacherUsername , subjectId: subjectId,
+      subjectName: subjectExists.name});
 
-    res.status(201).json({ message: "Course created", course: newCourse });
+    res.status(201).json({ message: "Course created and pending approval.", course: newCourse });
   } catch (error) {
      if (error.name === 'ValidationError') {
       const messages = Object.values(error.errors).map(err => err.message);
@@ -500,41 +576,78 @@ const addCourse = async (req, res) => {
     res.status(500).json({ message: "Failed to create course" });
   }
 };
-
+/////////////////// remove course ////////////////
 const removeCourse = async (req, res) => { // Create or adapt a delete function
   try {
-      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-           return res.status(400).json({ message: "Invalid course ID" });
-       }
-     const courseId = req.params.id;
-     const course = await Course.findByIdAndDelete(courseId);
+    const courseId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(courseId)) {
+        return res.status(400).json({ message: "Invalid course ID" });
+    }
+        // *** STEP 1: Check for Active Enrollments ***
+        const activeEnrollmentCount = await Enrollment.countDocuments({ course: courseId });
 
-     if (!course) {
-        return res.status(404).json({ message: 'Course not found' });
-     }
+        if (activeEnrollmentCount > 0) {
+            // If enrollments exist, block deletion and inform the admin
+            return res.status(400).json({
+                message: `Cannot delete course. ${activeEnrollmentCount} student(s) are actively enrolled. Please unenroll students first.`
+            });
+        }
+        // *** END ENROLLMENT CHECK ***
 
-     // Remove course from teacher's list
-      if (course.teacher) {
-        await User.findByIdAndUpdate(course.teacher, { $pull: { courses: courseId } });
-      }
+        // --- If no active enrollments, proceed with deletion ---
+        console.log(`No active enrollments found for course ${courseId}. Proceeding with deletion.`);
 
-     // Remove course from all enrolled students' lists
-     if (course.students && course.students.length > 0) {
-        await User.updateMany(
-            { _id: { $in: course.students } },
-            { $pull: { enrollments: courseId } }
-        );
-        console.log(`Removed course ${courseId} from ${course.students.length} student enrollment lists.`);
-     }
+        // Find the course to get its details for cleanup and logging *before* deleting
+        const course = await Course.findById(courseId);
+        if (!course) {
+            return res.status(404).json({ message: 'Course not found' });
+        }
 
+        // Use findByIdAndDelete which returns the deleted document
+        await Course.findByIdAndDelete(courseId);
+        console.log(`Course document ${courseId} deleted.`);
 
-      await logAdminActivity(req, 'COURSE_REMOVED', 'Course', courseId, course.name);
+        // --- Cleanup Associated Data ---
 
-     res.status(200).json({ message: 'Course deleted successfully' });
-  } catch (error) {
-     console.error("Error deleting course:", error);
-     res.status(500).json({ message: "Failed to delete course" });
-  }
+        // Remove from teacher's 'courses' list
+        if (course.teacher) {
+            await User.findByIdAndUpdate(course.teacher, { $pull: { courses: courseId } });
+            console.log(`Removed course ${courseId} from teacher ${course.teacher}'s list.`);
+        }
+
+        // Delete any pending/rejected Enrollment Requests for this course
+        const deletedRequests = await Enrollment.deleteMany({ course: courseId });
+        if (deletedRequests.deletedCount > 0) {
+            console.log(`Deleted ${deletedRequests.deletedCount} enrollment requests for course ${courseId}.`);
+        }
+
+        // Find Lesson IDs associated with the course BEFORE deleting lessons
+        const lessonIds = await Lesson.find({ course: courseId }).select('_id').lean();
+        const lessonIdArray = lessonIds.map(l => l._id);
+
+        // Delete associated Lessons
+        if (lessonIdArray.length > 0) {
+            const deletedLessons = await Lesson.deleteMany({ _id: { $in: lessonIdArray } });
+            if (deletedLessons.deletedCount > 0) {
+                console.log(`Deleted ${deletedLessons.deletedCount} lessons for course ${courseId}.`);
+
+                // Delete GeneratedContent linked to the deleted lessons
+                const deletedGenContent = await GeneratedContent.deleteMany({ lesson: { $in: lessonIdArray } });
+                if (deletedGenContent.deletedCount > 0) {
+                    console.log(`Deleted ${deletedGenContent.deletedCount} generated content items.`);
+                }
+            }
+        }
+
+        // --- Log Activity ---
+        await logAdminActivity(req, 'COURSE_REMOVED', 'Course', courseId, course.name);
+
+        res.status(200).json({ message: 'Course deleted successfully' });
+
+    } catch (error) {
+        console.error("Error deleting course:", error);
+        res.status(500).json({ message: "Failed to delete course" });
+    }
 };
 
 // --- NEW: Manage Students ---
@@ -568,63 +681,32 @@ const removeCourse = async (req, res) => { // Create or adapt a delete function
 // };
 const getAllStudents = async (req, res) => {
   try {
-    // Filter by grade if provided
-    let query = { role: 'student' };
-    if (req.query.grade) {
-      query.grade = req.query.grade;
-    }
+    // *** FIX: Initialize query object ***
+    let query = { role: 'student' }; // Initialize base query for students
+
     // Add search query for name/email
-    if (req.query.search) {
-      const searchQuery = new RegExp(req.query.search, 'i');
-      query.$or = [
-        { username: searchQuery },
-        { email: searchQuery }
-      ];
-    }
+     if (req.query.search) {
+         const searchQuery = new RegExp(req.query.search, 'i');
+         // Add the $or condition correctly to the existing query object
+         query.$or = [
+            { username: searchQuery },
+            { email: searchQuery }
+         ];
+     }
 
-    // Check if populate is requested
-    const shouldPopulate = req.query.populate === 'enrollments';
-    
-    let studentsQuery = User.find(query)
-      .select('-password -resetCode -resetCodeExpires')
-      .sort({ username: 1 });
+    // Remove populate logic if not needed for admin list view
+    const students = await User.find(query) // Pass the query object
+        .select('username email role createdAt updatedAt') // Select relevant fields
+        .sort({ username: 1 }) 
+        .lean();
 
-    if (shouldPopulate) {
-      studentsQuery = studentsQuery.populate({
-        path: 'enrollments',
-        select: 'name subject status teacher', // Only include these fields
-        populate: {
-          path: 'teacher',
-          select: 'username' // Only include teacher's username
-        }
-      });
-    }
-
-    const students = await studentsQuery.lean();
     res.status(200).json(students);
   } catch (error) {
     console.error("Error fetching students:", error);
     res.status(500).json({ message: "Failed to fetch students" });
   }
 };
-// const getStudentById = async (req, res) => {
-//   try {
-//      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-//         return res.status(400).json({ message: "Invalid student ID" });
-//      }
-//     const student = await User.findOne({ _id: req.params.id, role: 'student' })
-//                                 .select('-password -resetCode -resetCodeExpires')
-//                                 .populate('enrollments', 'name subject status teacher') // Populate more course details
-//                                 .lean();
-//     if (!student) {
-//       return res.status(404).json({ message: "Student not found" });
-//     }
-//     res.status(200).json(student);
-//   } catch (error) {
-//     console.error("Error fetching student by ID:", error);
-//     res.status(500).json({ message: "Failed to fetch student" });
-//   }
-// };
+
 const getStudentById = async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -632,43 +714,39 @@ const getStudentById = async (req, res) => {
     }
 
     // Check if populate is requested
-    const shouldPopulate = req.query.populate === 'enrollments';
-    
-    let studentQuery = User.findOne({ _id: req.params.id, role: 'student' })
-      .select('-password -resetCode -resetCodeExpires');
+   const shouldPopulate = req.query.populate === 'enrollments';
+     let studentQuery = User.findOne({ _id: req.params.id, role: 'student' })
+                            // *** REMOVED grade from select ***
+                           .select('username email role enrollments createdAt updatedAt');
 
-    if (shouldPopulate) {
-      studentQuery = studentQuery.populate({
-        path: 'enrollments',
-        select: 'name subject status teacher', // Only include these fields
-        populate: {
-          path: 'teacher',
-          select: 'username' // Only include teacher's username
-        }
-      });
-    }
+      if (shouldPopulate) {
+          studentQuery = studentQuery.populate({
+              path: 'enrollments', // Assuming this refers to the Enrollment model now via virtuals or separate query
+              select: 'course enrolledAt', // Example fields from Enrollment model
+              populate: { // Nested populate for course details within enrollment
+                  path: 'course',
+                  select: 'name subject status teacher',
+                  populate: { path: 'teacher subject', select: 'username name' } // Populate teacher/subject names
+              }
+          });
+      }
+
 
     const student = await studentQuery.lean();
-    console.log("Fetched student data:", student);
-    if (!student) {
-      return res.status(404).json({ message: "Student not found" });
-    }
-    
+
+    if (!student) { return res.status(404).json({ message: "Student not found" }); }
     res.status(200).json(student);
   } catch (error) {
     console.error("Error fetching student by ID:", error);
     res.status(500).json({ message: "Failed to fetch student" });
   }
-}; 
+};
 const addStudent = async (req, res) => {
     try {
       // Include grade in destructuring
-      const { username, email, password, grade } = req.body;
+      const { username, email, password} = req.body;
 
-      if (!grade) {
-         return res.status(400).json({ message: "Student grade level is required" });
-      }
-      // Add grade validation if necessary (e.g., check against allowed grades)
+      
 
       // Check if a user with the same email already exists
       let user = await User.findOne({ email });
@@ -681,7 +759,7 @@ const addStudent = async (req, res) => {
         email,
         password,
         role: 'student', // Ensure role is student
-        grade: grade,      // Assign grade
+       // grade: grade,      // Assign grade
         enrollments: []    // Initialize enrollments array
       });
       await newStudent.save();
@@ -695,7 +773,7 @@ const addStudent = async (req, res) => {
          username: newStudent.username,
          email: newStudent.email,
          role: newStudent.role,
-         grade: newStudent.grade,
+        
          enrollments: newStudent.enrollments,
          createdAt: newStudent.createdAt,
          updatedAt: newStudent.updatedAt
@@ -719,7 +797,7 @@ const updateStudent = async (req, res) => {
             return res.status(400).json({ message: "Invalid student ID" });
         }
 
-        const { username, email, grade } = req.body;
+        const { username, email } = req.body;
 
         // Basic validation for presence
         if (!username && !email && !grade) {
@@ -729,7 +807,7 @@ const updateStudent = async (req, res) => {
         const updateData = {};
         if (username !== undefined) updateData.username = username;
         if (email !== undefined) updateData.email = email;
-        if (grade !== undefined) updateData.grade = grade;
+        
 
          // Prevent accidental role change
         if (req.body.role) {
@@ -750,7 +828,7 @@ const updateStudent = async (req, res) => {
             { _id: req.params.id, role: 'student' }, // Ensure we only update students
             updateData,
             { new: true, runValidators: true }
-        ).select('-password -resetCode -resetCodeExpires'); // Exclude sensitive info
+        ).select('-password -resetCode -resetCodeExpires -grade'); // Exclude sensitive info
 
         if (!updatedStudent) {
             return res.status(404).json({ message: 'Student not found or user is not a student' });
@@ -771,188 +849,184 @@ const updateStudent = async (req, res) => {
 };
 
 const removeStudent = async (req, res) => {
-    try {
-         if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-            return res.status(400).json({ message: "Invalid student ID" });
-         }
+  try {
+    const studentId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(studentId)) { return res.status(400).json({ message: "Invalid student ID" }); }
 
-        const studentId = req.params.id;
-        const student = await User.findOneAndDelete({ _id: studentId, role: 'student' }); // Find and delete in one go
+   // Find student first to log username before deleting
+   const student = await User.findOne({ _id: studentId, role: 'student' });
+   if (!student) { return res.status(404).json({ message: "Student not found or user is not a student" }); }
 
-        if (!student) {
-            return res.status(404).json({ message: "Student not found or user is not a student" });
-        }
+   // --- Cleanup related data BEFORE deleting the user ---
 
-        // Post-deletion cleanup: Remove student from course enrollments
-        if (student.enrollments && student.enrollments.length > 0) {
-            await Course.updateMany(
-                { _id: { $in: student.enrollments } },
-                { $pull: { students: studentId } } // Remove student's ID from the 'students' array in courses
-            );
-            console.log(`Removed student ${studentId} from ${student.enrollments.length} course enrollment lists.`);
-        }
+   // 1. Delete active Enrollments for this student
+   const deletedEnrollments = await Enrollment.deleteMany({ student: studentId });
+   if (deletedEnrollments.deletedCount > 0) {
+       console.log(`Deleted ${deletedEnrollments.deletedCount} active enrollments for student ${studentId}.`);
+   }
 
+   // 2. Delete pending/rejected Enrollment Requests for this student
+   const deletedRequests = await Enrollment.deleteMany({ student: studentId });
+    if (deletedRequests.deletedCount > 0) {
+       console.log(`Deleted ${deletedRequests.deletedCount} enrollment requests for student ${studentId}.`);
+   }
 
-        // Log activity
-        await logAdminActivity(req, 'STUDENT_REMOVED', 'User', studentId, student.username);
+   // 3. Remove student from the 'students' array in any Courses they were enrolled in
+   // (This step is redundant if we delete Enrollment documents, but can be kept as safety)
+   // This requires knowing which courses they *were* enrolled in before deleting Enrollments.
+   // It's simpler to rely on the Enrollment document deletion.
+   // await Course.updateMany(
+   //     { students: studentId }, // Find courses where student is listed
+   //     { $pull: { students: studentId } }
+   // );
 
-        res.status(200).json({ message: "Student removed successfully" });
-    } catch (error) {
-        console.error("Error removing student:", error);
-        res.status(500).json({ message: "Failed to remove student" });
-    }
+   // --- Now delete the student ---
+   await User.findByIdAndDelete(studentId);
+
+   // Log activity
+   await logAdminActivity(req, 'STUDENT_REMOVED', 'User', studentId, student.username);
+
+   res.status(200).json({ message: "Student and associated enrollments/requests removed successfully" });
+} catch (error) {
+   console.error("Error removing student:", error);
+   res.status(500).json({ message: "Failed to remove student" });
+}
 };
 
-
-const enrollStudentInCourse = async (req, res) => {
+// *** NEW FUNCTION: Admin gets enrollments for a SPECIFIC student ***
+const getEnrollmentsForStudent = async (req, res) => {
   try {
-    const { studentId, courseId } = req.params;
+      const { studentId } = req.params; // Get student ID from route parameter
 
-    if (!mongoose.Types.ObjectId.isValid(studentId) || !mongoose.Types.ObjectId.isValid(courseId)) {
-      return res.status(400).json({ message: 'Invalid Student or Course ID' });
-    }
+      if (!mongoose.Types.ObjectId.isValid(studentId)) {
+          return res.status(400).json({ message: 'Invalid Student ID format.' });
+      }
 
-    // Use Promise.all for concurrent checks
-    const [student, course] = await Promise.all([
-      User.findOne({ _id: studentId, role: 'student' }),
-      Course.findById(courseId)
-    ]);
+      // Optional: Verify the studentId actually corresponds to a user with role 'student'
+      const studentExists = await User.countDocuments({ _id: studentId, role: 'student' });
+      if (studentExists === 0) {
+          return res.status(404).json({ message: 'Student not found.' });
+      }
 
-    if (!student) return res.status(404).json({ message: 'Student not found' });
-    if (!course) return res.status(404).json({ message: 'Course not found' });
-     if (course.status !== 'approved') {
-         return res.status(400).json({ message: 'Cannot enroll student in a non-approved course' });
-     }
+      // Find active enrollments for the specified student
+      const enrollments = await Enrollment.find({ student: studentId })
+          .populate({
+              path: 'course', // Populate course details
+              // Match: { status: 'approved' }, // Maybe admin wants to see enrollments even if course later becomes pending/rejected? Decide this. Let's show all for now.
+              select: 'name subject status teacher price', // Fields admin might want to see
+              populate: [
+                  { path: 'teacher', select: 'username' },
+                  { path: 'subject', select: 'name' }
+              ]
+          })
+          .sort({ enrolledAt: -1 }) // Sort by enrollment date
+          .lean();
 
-    // Check if already enrolled
-    const isAlreadyEnrolledStudent = student.enrollments?.includes(courseId) ?? false;
-    const isAlreadyEnrolledCourse = course.students?.includes(studentId) ?? false;
+      // No need to filter by course status here unless required by admin view
 
-    if (isAlreadyEnrolledStudent || isAlreadyEnrolledCourse) {
-        // If inconsistent, fix it, otherwise return message
-        if (!isAlreadyEnrolledStudent) await User.findByIdAndUpdate(studentId, { $addToSet: { enrollments: courseId } });
-        if (!isAlreadyEnrolledCourse) await Course.findByIdAndUpdate(courseId, { $addToSet: { students: studentId } });
-        return res.status(400).json({ message: 'Student is already enrolled in this course' });
-    }
-
-
-    // Perform updates using $addToSet to prevent duplicates
-    await Promise.all([
-      User.findByIdAndUpdate(studentId, { $addToSet: { enrollments: courseId } }),
-      Course.findByIdAndUpdate(courseId, { $addToSet: { students: studentId } })
-    ]);
-
-     // Log activity
-     await logAdminActivity(req, 'STUDENT_ENROLLED', 'User', studentId, student.username, { courseId: courseId, courseName: course.name });
-
-
-    res.status(200).json({ message: 'Student enrolled successfully' });
+      res.status(200).json(enrollments); // Return the list of enrollment documents
 
   } catch (error) {
-    console.error('Error enrolling student:', error);
-    res.status(500).json({ message: 'Failed to enroll student' });
+      console.error(`Error fetching enrollments for student ${req.params.studentId} by admin:`, error);
+      res.status(500).json({ message: 'Failed to fetch student enrollments.' });
   }
 };
 
-
-const unenrollStudentFromCourse = async (req, res) => {
-  try {
-    const { studentId, courseId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(studentId) || !mongoose.Types.ObjectId.isValid(courseId)) {
-      return res.status(400).json({ message: 'Invalid Student or Course ID' });
-    }
-
-      // Optional: Check if student and course exist before proceeding
-      const [studentExists, courseExists] = await Promise.all([
-          User.countDocuments({ _id: studentId, role: 'student' }),
-          Course.countDocuments({ _id: courseId })
-      ]);
-       if (studentExists === 0) return res.status(404).json({ message: 'Student not found' });
-       if (courseExists === 0) return res.status(404).json({ message: 'Course not found' });
-
-    // Use $pull to remove from arrays
-    await Promise.all([
-      User.findByIdAndUpdate(studentId, { $pull: { enrollments: courseId } }),
-      Course.findByIdAndUpdate(courseId, { $pull: { students: studentId } })
-    ]);
-
-     // Log activity (fetch names before pull for logging, or just use IDs)
-    // If you need names, fetch student/course before the pull operations
-    await logAdminActivity(req, 'STUDENT_UNENROLLED', 'User', studentId, 'N/A', { courseId: courseId }); // User name might be fetched if needed
-
-    res.status(200).json({ message: 'Student unenrolled successfully' });
-
-  } catch (error) {
-    console.error('Error unenrolling student:', error);
-    res.status(500).json({ message: 'Failed to unenroll student' });
-  }
-};
 //////////////////////////////////////////////////////////
 
 // 4. Reports
 const getReports = async (req, res) => {
   try {
-    const [courses, teachers, students] = await Promise.all([
-        Course.find({}).lean(),
-        User.find({ role: 'teacher' }).select('username courses').lean(),
-        User.find({ role: 'student' }).select('grade').lean() // <-- Fetch students with grade
-    ]);
+const [
+  courses,
+  teachers,
+  studentCount,
+  // *** NEW: Fetch required progress data ***
+  totalEnrollmentsCount, // Count active enrollments
+  allProgressRecords, // Fetch ALL progress records for calculations
+  totalProblemReports,
+  newProblemReportsCount // Optional: Count of new reports
+] = await Promise.all([
+  Course.find({}).populate('subject', 'name').lean(),
+  User.find({ role: 'teacher' }).select('username courses').lean(),
+  User.countDocuments({ role: 'student' }),
+  Enrollment.countDocuments({}), // Count total active enrollments
+  StudentProgress.find({}).select('student course lesson status').lean(), // Select fields needed for aggregation
+  ProblemReport.countDocuments({}), // *** Get total problem reports ***
+            ProblemReport.countDocuments({ status: 'new' }) // *** Get count of new reports ***
+]);
 
-    const statusCounts = { pending: 0, approved: 0, rejected: 0, total: courses.length };
-    const coursesPerSubject = {};
-    const coursesPerGrade = {};
+// --- Course Status Breakdown ---
+const statusCounts = { pending: 0, approved: 0, rejected: 0, total: courses.length };
+courses.forEach(c => { if (statusCounts.hasOwnProperty(c.status)) statusCounts[c.status]++; });
 
-    courses.forEach(course => {
-        if (statusCounts.hasOwnProperty(course.status)) {
-            statusCounts[course.status]++;
-        }
-        const subject = course.subject || 'Uncategorized';
-        coursesPerSubject[subject] = (coursesPerSubject[subject] || 0) + 1;
-        const grade = course.grade || 'Uncategorized';
-        coursesPerGrade[grade] = (coursesPerGrade[grade] || 0) + 1;
-    });
+// --- Courses per Subject ---
+const coursesPerSubject = {};
+courses.forEach(c => { coursesPerSubject[c.subject?.name ?? 'Uncategorized'] = (coursesPerSubject[c.subject?.name ?? 'Uncategorized'] || 0) + 1; });
+const subjectDistribution = Object.entries(coursesPerSubject).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
 
-     const subjectDistribution = Object.entries(coursesPerSubject).map(([name, count]) => ({ name, count })).sort((a,b) => b.count - a.count);
-     const gradeDistribution = Object.entries(coursesPerGrade).map(([name, count]) => ({ name, count })).sort((a,b) => a.name.localeCompare(b.name)); // Sort grades alphabetically/numerically if possible
-     const coursesPerTeacher = teachers.map(teacher => ({
-        name: teacher.username,
-        count: teacher.courses ? teacher.courses.length : 0
-     })).sort((a, b) => b.count - a.count);
+// --- Courses per Teacher ---
+const coursesPerTeacher = teachers.map(t => ({ name: t.username, count: t.courses?.length ?? 0 })).sort((a, b) => b.count - a.count);
 
-        // *** --- NEW: Student Calculations --- ***
-    const totalStudents = students.length; // Total count
-    const studentsPerGrade = {};
-    students.forEach(student => {
-        const grade = student.grade || 'Ungraded'; // Handle missing grade for students
-        studentsPerGrade[grade] = (studentsPerGrade[grade] || 0) + 1;
-    });
-    // Convert to array format for charts
-    const studentGradeDistribution = Object.entries(studentsPerGrade)
-                                      .map(([name, count]) => ({ name, count }))
-                                      .sort((a,b) => a.name.localeCompare(b.name)); // Sort by grade name
-    // *** --- END: Student Calculations --- ***
+// --- Student Count ---
+const totalStudents = studentCount;
 
-    const placeholderCompletionRate = 0.0; // Set to 0 until implemented
+// --- *** Real Progress Aggregation *** ---
 
-    const reportData = {
-        courseStatusCounts: statusCounts,
-        subjectDistribution: subjectDistribution,
-        gradeDistribution: gradeDistribution,
-        coursesPerTeacher: coursesPerTeacher,
-        totalStudents: totalStudents,                 // <-- Add total students
-        studentGradeDistribution: studentGradeDistribution, // <-- Add student distribution
-        placeholderCourseCompletionRate: placeholderCompletionRate
-    };
+let totalCompletedLessons = 0;
+let totalLessonsWithProgress = 0; // Count lessons students have started
+const lessonsCompletedPerStudent = {}; // { studentId: count }
 
-    res.status(200).json(reportData);
-
-  } catch (error) {
-    console.error("Error generating reports:", error);
-    res.status(500).json({ message: "Failed to generate reports" });
+allProgressRecords.forEach(p => {
+  totalLessonsWithProgress++; // Count any interaction
+  if (p.status === 'completed') {
+      totalCompletedLessons++;
+      const studentIdStr = p.student.toString();
+      lessonsCompletedPerStudent[studentIdStr] = (lessonsCompletedPerStudent[studentIdStr] || 0) + 1;
   }
+});
+   
+// Calculate Average Lessons Completed per Student (who has started at least one lesson)
+const studentsWithProgress = Object.keys(lessonsCompletedPerStudent).length;
+const averageLessonsCompleted = studentsWithProgress > 0
+  ? Math.round(totalCompletedLessons / studentsWithProgress) // Average among active students
+  : 0;
+
+// Calculate Overall Platform Completion Rate (Completed Lessons / Total Lessons in *Approved* Courses)
+// This requires fetching the total number of lessons in *approved* courses
+const approvedCourses = courses.filter(c => c.status === 'approved');
+const approvedCourseIds = approvedCourses.map(c => c._id);
+const totalLessonsInApprovedCourses = await Lesson.countDocuments({ course: { $in: approvedCourseIds } });
+
+const overallCompletionRate = totalLessonsInApprovedCourses > 0
+  ? (totalCompletedLessons / totalLessonsInApprovedCourses)
+  : 0;
+
+console.log("Progress Calculation:", {
+  totalCompletedLessons, totalLessonsWithProgress, studentsWithProgress, averageLessonsCompleted, totalLessonsInApprovedCourses, overallCompletionRate
+});
+
+// --- Assemble the FINAL Report Data ---
+const reportData = {
+  courseStatusCounts: statusCounts,
+  subjectDistribution: subjectDistribution,
+  coursesPerTeacher: coursesPerTeacher,
+  totalStudents: totalStudents,
+  totalEnrollments: totalEnrollmentsCount, // Add total enrollments count
+  // Use real calculated values, replace placeholders
+  overallCompletionRate: overallCompletionRate,         // Use calculated rate
+  averageLessonsCompleted: averageLessonsCompleted, // Use calculated average
+  totalProblemReports, // *** Add this to response ***
+  newProblemReportsCount,
 };
 
+res.status(200).json(reportData);
+
+} catch (error) {
+console.error("Error generating reports:", error);
+res.status(500).json({ message: "Failed to generate reports" });
+}
+};
 
 // 5. Settings (Admin Profile)
 const getAdminSettings = async (req, res) => {
@@ -1021,6 +1095,148 @@ const getActivityLog = async (req, res) => {
       res.status(500).json({ message: "Failed to fetch activity log" });
   }
 };
+const enrollStudentInCourse = async (req, res) => {
+  try {
+      const { studentId, courseId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(studentId) || !mongoose.Types.ObjectId.isValid(courseId)) {
+          return res.status(400).json({ message: 'Invalid Student or Course ID' });
+      }
+
+      // Use Promise.all for concurrent checks/fetches
+      const [student, course] = await Promise.all([
+          User.findOne({ _id: studentId, role: 'student' }).lean(), // Ensure it's a student
+          Course.findById(courseId).select('name').lean() // Check course exists
+      ]);
+
+      if (!student) return res.status(404).json({ message: 'Student not found' });
+      if (!course) return res.status(404).json({ message: 'Course not found' });
+
+      // Use findOneAndUpdate with upsert to create enrollment if it doesn't exist
+      const enrollment = await Enrollment.findOneAndUpdate(
+          { student: studentId, course: courseId },
+          { $setOnInsert: { student: studentId, course: courseId, enrolledAt: new Date() } },
+          { new: true, upsert: true, runValidators: true }
+      );
+
+      // Log activity
+      await logAdminActivity(req, 'STUDENT_ENROLLED', 'User', studentId, student.username, { courseId: courseId, courseName: course.name, method: 'Admin Override' });
+
+      res.status(200).json({ message: 'Student manually enrolled successfully', enrollment });
+
+  } catch (error) {
+      console.error('Error during admin enrollment:', error);
+      res.status(500).json({ message: 'Failed to enroll student' });
+  }
+};
+
+// Admin Manually Unenrolls a Student
+const unenrollStudentFromCourse = async (req, res) => {
+  try {
+      const { studentId, courseId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(studentId) || !mongoose.Types.ObjectId.isValid(courseId)) {
+          return res.status(400).json({ message: 'Invalid Student or Course ID' });
+      }
+
+      // Find and delete the specific enrollment document
+      const deletedEnrollment = await Enrollment.findOneAndDelete({
+          student: studentId,
+          course: courseId
+      });
+
+      if (!deletedEnrollment) {
+          return res.status(404).json({ message: 'Enrollment record not found. Student might not be enrolled in this course.' });
+      }
+
+      // Log activity (fetch names if needed, or use IDs)
+      // const student = await User.findById(studentId).select('username').lean();
+      // const course = await Course.findById(courseId).select('name').lean();
+      await logAdminActivity(req, 'STUDENT_UNENROLLED', 'User', studentId, 'N/A', { courseId: courseId, method: 'Admin Override' });
+
+      res.status(200).json({ message: 'Student manually unenrolled successfully' });
+
+  } catch (error) {
+      console.error('Error during admin unenrollment:', error);
+      res.status(500).json({ message: 'Failed to unenroll student' });
+  }
+};
+///////////////////////////
+
+const getCourseEnrollments = async (req, res) => {
+  try {
+      const { courseId } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(courseId)) {
+          return res.status(400).json({ message: 'Invalid Course ID format.' });
+      }
+
+      // Find enrollments for the course and populate student details
+      const enrollments = await Enrollment.find({ course: courseId })
+          .populate({
+              path: 'student', // Populate the student field in Enrollment
+              select: 'username email' // Select desired student fields
+          })
+          .select('student course enrolledAt createdAt updatedAt') // Select Enrollment fields
+          .sort({ enrolledAt: -1 }) // Sort by enrollment date
+          .lean();
+
+      if (!enrollments) {
+          // This case might not be hit often if find returns [], but good practice
+          return res.status(404).json({ message: 'No enrollments found for this course.' });
+      }
+
+      res.status(200).json(enrollments); // Return the list of enrollments (with populated students)
+
+  } catch (error) {
+      console.error(`Error fetching enrollments for course ${req.params.courseId}:`, error);
+      res.status(500).json({ message: 'Failed to fetch course enrollments.' });
+  }
+};
+//////////////////////////////////////////////////////////////////////
+// Approve Course
+exports.approveCourse = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    // Find the course by ID and change status to 'approved'
+    const course = await Course.findByIdAndUpdate(
+      courseId,
+      { status: 'approved' },
+      { new: true }
+    );
+
+    if (!course) {
+      return res.status(404).json({ message: 'Course not found' });
+    }
+
+    res.status(200).json({ message: 'Course approved', course });
+  } catch (error) {
+    console.error('Error approving course:', error);
+    res.status(500).json({ message: 'Failed to approve course' });
+  }
+};
+
+// Reject Course
+exports.rejectCourse = async (req, res) => {
+  try {
+    const { courseId } = req.params;
+
+    // Find and delete the course
+    const course = await Course.findByIdAndDelete(courseId);
+
+    if (!course) {
+      return res.status(404).json({ message: 'Course not found' });
+    }
+
+    res.status(200).json({ message: 'Course rejected and deleted', course });
+  } catch (error) {
+    console.error('Error rejecting course:', error);
+    res.status(500).json({ message: 'Failed to reject course' });
+  }
+};
+
+
 // --- EXPORTS ---
 module.exports = {
   // Overview
@@ -1056,5 +1272,7 @@ module.exports = {
   getAdminSettings,
   updateAdminSettings,
   // Activity Log
-  getActivityLog
+  getActivityLog,
+getCourseEnrollments,
+getEnrollmentsForStudent
 };

@@ -60,91 +60,97 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
 const UserSchema = new mongoose.Schema({
-  username: { type: String, required: true },
-  email:  { 
-    type: String, 
-    required: true, 
-    unique: true,
-    validate: {
-      validator: function(v) {
-        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);  // Basic email regex
-      },
-      message: props => `${props.value} is not a valid email address!`
-    }
-  },
-  password: { type: String, required: true },
-  role: {
-    type: String,
-    required: true,
-    enum: ['student', 'teacher', 'admin'],
-    default: 'student'
-  },
-  resetCode: { type: String },
-  resetCodeExpires: { type: Date },
-  // Add courses for teachers
-  courses: {
-    type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Course' }],
-    default: undefined, // Make it explicitly undefined if not a teacher
-   // required: function() { return this.role === 'teacher'; } // Optional: required only for teachers
-  },
-grade: {
-  type: String,
-  // Consider adding enum if grades are fixed: enum: ['Grade 1', 'Grade 2', ... 'Grade 12', 'Other'],
-  default: undefined, // Make it explicitly undefined if not a student
- // required: function() { return this.role === 'student'; } // Optional: required only for students
-},
-enrollments: { // Courses the student is enrolled in
-  type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Course' }],
-  default: undefined, // Make it explicitly undefined if not a student
- // required: function() { return this.role === 'student'; } // Optional: required only for students
-}
-}, { timestamps: true });  //added timestamps
+    username: {
+        type: String,
+        required: [true, 'Username is required.'],
+        unique: true, 
+        trim: true
+    },
+    email: {
+        type: String,
+        required: [true, 'Email is required.'],
+        unique: true, // Ensure emails are unique across all users
+        trim: true,
+        lowercase: true, // Store emails consistently
+        validate: {
+            validator: (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v), // Basic email format check
+            message: props => `${props.value} is not a valid email address!`
+        }
+    },
+    password: {
+        type: String,
+        required: [true, 'Password is required.'],
+        minlength: [6, 'Password must be at least 6 characters long.'] // Add min length validation
+    },
+    role: {
+        type: String,
+        required: true,
+        enum: ['student', 'teacher', 'admin'],
+        default: 'student' // Default new users to student role
+    },
+    resetCode: { type: String }, // For password reset via code
+    resetCodeExpires: { type: Date },
 
-// Remove empty arrays on save if role doesn't match
-UserSchema.pre('save', function(next) {
-  if (this.role !== 'teacher' && this.courses !== undefined) {
-    this.courses = undefined;
-  }
-  if (this.role !== 'student' && this.enrollments !== undefined) {
-    this.enrollments = undefined;
-  }
-   if (this.role !== 'student' && this.grade !== undefined) {
-    this.grade = undefined;
-  }
-  next();
+    // --- Teacher Specific ---
+    courses: { // Courses *managed* by the teacher
+        type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Course' }],
+        default: undefined, // Default to undefined, set to [] in pre-save if role is teacher
+    },
+
+    favoriteCourses: {
+        type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Course' }],
+        default: [] // Default to an empty array for students
+    }
+
+
+}, { timestamps: true }); // Automatically add createdAt and updatedAt
+
+// --- Hooks ---
+
+// Hash password & Manage role-specific fields before saving
+UserSchema.pre('save', async function(next) {
+    // --- Password Hashing ---
+    if (this.isModified('password')) {
+        try {
+            // Add extra check for minimum length before hashing if not done by schema validation
+            if (this.password.length < 6) {
+                 throw new Error('Password must be at least 6 characters long.');
+            }
+            const salt = await bcrypt.genSalt(10);
+            this.password = await bcrypt.hash(this.password, salt);
+        } catch (err) {
+            return next(err); // Pass hashing error
+        }
+    }
+
+    // --- Role-Specific Field Management ---
+
+    if (this.role === 'teacher') {
+        this.favoriteCourses = undefined;
+        this.courses = this.courses || []; // Ensure courses is an array for teachers if needed
+    } else if (this.role === 'student') {
+        
+        this.courses = undefined;
+        this.favoriteCourses = this.favoriteCourses || [];
+
+    } else { // Admin or other roles
+       
+        this.courses = undefined;
+        this.favoriteCourses = undefined;
+    }
+
+    next(); // Proceed to save
 });
 
-// Hash password before saving (if modified)
-UserSchema.pre('save', async function (next) {
-    if (!this.isModified('password')) return next();
-    try{
-    const salt = await bcrypt.genSalt(10);
-    this.password = await bcrypt.hash(this.password, salt);
-    ////////////////////
-    // Ensure role-specific fields are handled based on role BEFORE final save
-    if (this.role === 'teacher') {
-      this.grade = undefined;
-      this.enrollments = undefined;
-      this.courses = this.courses || []; // Ensure it's an array if teacher
-    } else if (this.role === 'student') {
-      this.courses = undefined;
-      this.enrollments = this.enrollments || []; // Ensure it's an array if student
-      // Grade should be set during creation/update for student
-    } else { // Admin or other roles
-      this.courses = undefined;
-      this.enrollments = undefined;
-      this.grade = undefined;
-    }
-    //////////////////
-    next();
-  } catch (err) {
-    next(err); // Pass error to the next middleware or save operation
-  }
-  });
-  
-  // Compare password method
-  UserSchema.methods.comparePassword = async function (candidatePassword) {
-    return await bcrypt.compare(candidatePassword, this.password);
-  };  
 
-module.exports = mongoose.model('User', UserSchema); 
+// --- Methods ---
+UserSchema.methods.comparePassword = async function(candidatePassword) {
+    try {
+        return await bcrypt.compare(candidatePassword, this.password);
+    } catch (error) {
+        console.error("Error comparing password:", error);
+        return false; // Return false on comparison error
+    }
+};
+
+module.exports = mongoose.model('User', UserSchema);

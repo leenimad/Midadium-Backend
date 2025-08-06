@@ -1,0 +1,17 @@
+config/firebase-service-account-key.json
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# OS and editor files
+.DS_Store
+.vscode/
+
+# Build files (optional)
+dist/
+build/
